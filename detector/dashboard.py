@@ -2,10 +2,10 @@ from flask import Flask, render_template_string, jsonify
 import psutil
 import time
 import threading
+from collections import deque
 
 app = Flask(__name__)
 
-# Shared state — updated by main loop, read by dashboard
 _state = {
     'banned_ips': {},
     'global_rate': 0,
@@ -14,6 +14,9 @@ _state = {
     'uptime_start': time.time(),
 }
 
+# Store baseline history for the graph — (timestamp, mean, stddev)
+_baseline_history = deque(maxlen=200)
+
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
@@ -21,6 +24,7 @@ DASHBOARD_HTML = """
 <meta charset="utf-8">
 <title>HNG Anomaly Detector</title>
 <meta http-equiv="refresh" content="3">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
   body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
   h1 { color: #58a6ff; }
@@ -35,6 +39,8 @@ DASHBOARD_HTML = """
           border-radius: 6px; padding: 12px 20px; margin: 8px; min-width: 140px; }
   .stat-val { font-size: 28px; color: #58a6ff; }
   .stat-label { font-size: 11px; color: #8b949e; margin-top: 4px; }
+  .chart-container { background: #161b22; border: 1px solid #30363d;
+                     border-radius: 6px; padding: 16px; margin: 16px 0; }
 </style>
 </head>
 <body>
@@ -72,6 +78,17 @@ DASHBOARD_HTML = """
   </div>
 </div>
 
+<h2>Baseline Over Time</h2>
+<div class="chart-container">
+  {% if has_history %}
+  <canvas id="baselineChart" height="80"></canvas>
+  {% else %}
+  <p style="color:#8b949e; text-align:center; padding: 40px 0;">
+    &#x23F3; Waiting for baseline data — recalculates every 60 seconds...
+  </p>
+  {% endif %}
+</div>
+
 <h2>Banned IPs</h2>
 {% if banned_ips %}
 <table>
@@ -106,6 +123,59 @@ DASHBOARD_HTML = """
   </tr>
   {% endfor %}
 </table>
+
+{% if has_history %}
+<script>
+const labels = {{ labels | tojson }};
+const means  = {{ means  | tojson }};
+const stddevs = {{ stddevs | tojson }};
+
+const ctx = document.getElementById('baselineChart').getContext('2d');
+new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: labels,
+    datasets: [
+      {
+        label: 'Effective Mean (req/s)',
+        data: means,
+        borderColor: '#58a6ff',
+        backgroundColor: 'rgba(88,166,255,0.1)',
+        tension: 0.3,
+        fill: true,
+        pointRadius: 2,
+      },
+      {
+        label: 'Stddev',
+        data: stddevs,
+        borderColor: '#3fb950',
+        backgroundColor: 'rgba(63,185,80,0.1)',
+        tension: 0.3,
+        fill: false,
+        pointRadius: 2,
+        borderDash: [4, 4],
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: { labels: { color: '#8b949e' } }
+    },
+    scales: {
+      x: {
+        ticks: { color: '#8b949e', maxTicksLimit: 12 },
+        grid:  { color: '#21262d' }
+      },
+      y: {
+        ticks: { color: '#8b949e' },
+        grid:  { color: '#21262d' }
+      }
+    }
+  }
+});
+</script>
+{% endif %}
 </body>
 </html>
 """
@@ -133,6 +203,15 @@ def index():
             'condition': info.get('condition', '-'),
         }
 
+    # Build graph data from history
+    # FIX: guard against empty history so Chart.js is never called with empty arrays
+    history_list = list(_baseline_history)
+    has_history  = len(history_list) > 0
+
+    labels  = [h[0] for h in history_list]
+    means   = [round(h[1], 4) for h in history_list]
+    stddevs = [round(h[2], 4) for h in history_list]
+
     return render_template_string(
         DASHBOARD_HTML,
         now=now,
@@ -145,6 +224,10 @@ def index():
         uptime=uptime,
         top_ips=state['top_ips'],
         banned_ips=banned_ips,
+        has_history=has_history,
+        labels=labels,
+        means=means,
+        stddevs=stddevs,
     )
 
 @app.route('/api/metrics')
@@ -164,8 +247,13 @@ def update_state(banned_ips, global_rate, top_ips, baseline):
     _state['top_ips'] = top_ips
     _state['baseline'] = baseline
 
+def record_baseline(mean: float, stddev: float):
+    """Call this every time baseline is recalculated to feed the graph."""
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime('%H:%M')
+    _baseline_history.append((ts, mean, stddev))
+
 def run_dashboard(host='0.0.0.0', port=8080):
-    """Run Flask in a background thread (non-blocking)."""
     t = threading.Thread(
         target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False),
         daemon=True

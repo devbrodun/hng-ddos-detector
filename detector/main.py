@@ -9,7 +9,7 @@ from detector import AnomalyDetector
 from blocker import Blocker
 from unbanner import Unbanner
 from notifier import Notifier
-from dashboard import run_dashboard, update_state
+from dashboard import run_dashboard, update_state, record_baseline
 
 
 def load_config(path='config.yaml') -> dict:
@@ -58,18 +58,13 @@ async def main():
         while not queue.empty() and processed < 500:
             record = await queue.get()
             ip = record['source_ip']
-            # Use current time for sliding window — ensures accurate rate tracking
             now = time.time()
             status = int(record.get('status', 200))
             is_error = status >= 400
 
-            # Feed into baseline using log timestamp for accurate history
             baseline.record_request(record['_parsed_time'], is_error=is_error)
-
-            # Feed into detector using current time for sliding window
             detector.record(ip, now, status)
 
-            # Skip banned IPs
             if not blocker.is_banned(ip):
                 anomaly = detector.check_ip(ip, baseline.get_baseline())
                 if anomaly:
@@ -105,6 +100,8 @@ async def main():
         if baseline.maybe_recalculate():
             b = baseline.get_baseline()
             blocker.audit_baseline(b['mean'], b['stddev'])
+            # Feed the dashboard graph
+            record_baseline(b['mean'], b['stddev'])
             print(f"[main] Baseline recalc: mean={b['mean']:.4f} "
                   f"stddev={b['stddev']:.4f} samples={b['samples']}")
 
